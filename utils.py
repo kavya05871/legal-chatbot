@@ -1,220 +1,334 @@
 import json
-import os
-from typing import Dict, Generator, List
+import subprocess
+from pathlib import Path
+from typing import Dict, List, Union
 
-import streamlit as st
-import yaml
-from langfuse.decorators import langfuse_context, observe
+import numpy as np
+import tiktoken
+from langfuse.decorators import observe
 from langfuse.openai import openai
 from loguru import logger
-from openai.types.chat import ChatCompletion
-from pydantic import BaseModel
+from openai.types import CreateEmbeddingResponse
 from qdrant_client import QdrantClient
-
-from database.utils import embed_text, get_context, search
-from llm.prompts import DEFAULT_CONTEXT
-from llm.utils import formate_messages_chat
-from router.query_router import formate_messages_router
-from router.router_prompt import DEFAULT_ROUTER_RESPONSE
-
-LOGO_URL = "assets/Legabot-Logomark.svg"
-LOGO_TEXT_LIGHT_URL = "assets/Legabot-Light-Horizontal.svg"
-LOGO_TEXT_DARK_URL = "assets/Legabot-Dark-Horizontal.svg"
-TEXT_URL = "assets/Legabot-Dark-Typography.svg"
-
-WARNING_MESSAGE = """
-_Please note that LegaBot may make **mistakes**. For critical legal information, always **verify** with a qualified legal professional. LegaBot is here to assist, not replace professional legal advice._
-"""
-
-QUERY_SUGGESTIONS = """
-Na koliko dana godisnjeg imam pravo?\n
-Da li smem da koristim porodiljsko bolovanje zene umesto nje?\n
-Koji porez placam ako sam preduzetnik?\n
-Da li mogu da trazim da se izbrisu moji podaci sa sajta ako ih nisam odobrio?\n
-U kom roku mogu da trazim zamenu proizvoda kojim nisam zadovoljan?\n
-Kome pripadaju pokloni koje smo muz i ja dobili na vencanju?
-"""
-
-AUTHORS = """
-[Anja Berić](https://www.linkedin.com/in/anja-beric-150285vb/?originalSubdomain=rs)\n
-[Milutin Studen](https://www.linkedin.com/in/milutin-studen/)
-"""
+from qdrant_client.http.models import (
+    Distance,
+    Filter,
+    PointStruct,
+    ScoredPoint,
+    UpdateResult,
+    VectorParams,
+)
+from tqdm.auto import tqdm
 
 
-class RouterConfig(BaseModel):
-    model: str
-    temperature: float
+def create_collection(
+    client: QdrantClient,
+    name: str,
+    vector_size: int = 1536,
+    distance: Distance = Distance.COSINE,
+) -> bool:
+    """Create a collection in Qdrant."""
+    logger.info(f'Creating collection: "{name}" with vector size: {vector_size}.')
+    return client.recreate_collection(
+        collection_name=name,
+        vectors_config=VectorParams(size=vector_size, distance=distance),
+    )
 
 
-class ChatConfig(BaseModel):
-    model: str
-    temperature: float
-    max_conversation: int
+def delete_collection(
+    client: QdrantClient, collection: str, timeout: int = None
+) -> bool:
+    logger.info(f'Deleting collection: "{collection}".')
+    return client.delete_collection(collection_name=collection, timeout=timeout)
 
 
-class EmbeddingsConfig(BaseModel):
-    model: str
-    dimensions: int
+def get_collection_info(client: QdrantClient, collection: str) -> Dict:
+    return client.get_collection(collection_name=collection)
 
 
-class OpenAIConfig(BaseModel):
-    embeddings: EmbeddingsConfig
-    chat: ChatConfig
-    router: RouterConfig
+def get_count(client: QdrantClient, collection: str) -> int:
+    return client.count(collection_name=collection).count
 
 
-class Config(BaseModel):
-    openai: OpenAIConfig
+def upsert(
+    client: QdrantClient,
+    collection: str,
+    points: List[PointStruct],
+) -> UpdateResult:
+    """Upsert data points into a Qdrant collection."""
+    return client.upsert(collection_name=collection, points=points)
 
 
-def load_config(yaml_file_path: str = "./config.yaml") -> Config:
-    with open(yaml_file_path, "r") as file:
-        yaml_content = yaml.safe_load(file)
-    return Config(**yaml_content)
-
-
-@st.cache_resource
-def initialize_clients() -> QdrantClient:
-    """
-    Initializes and returns the clients for OpenAI and Qdrant services.
-
-    Returns:
-    - Tuple[OpenAI, QdrantClient]: A tuple containing the initialized OpenAI and Qdrant clients.
-
-    Raises:
-    - EnvironmentError: If required environment variables are missing.
-    """
+def num_tokens_from_string(string: str, model: str) -> int:
+    """Returns the number of tokens in a text string."""
     try:
-        # Retrieve Qdrant client configuration from environment variables
-        qdrant_url = os.environ["QDRANT_CLUSTER_URL"]
-        qdrant_api_key = os.environ["QDRANT_API_KEY"]
-        qdrant_client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
-
-        return qdrant_client
-    except KeyError as e:
-        error_msg = f"Missing environment variable: {str(e)}"
-        logger.error(error_msg)
-        raise EnvironmentError(error_msg)
+        encoding = tiktoken.encoding_for_model(model)
+    except KeyError:
+        logger.info("Warning: model not found. Using cl100k_base encoding.")
+        encoding = tiktoken.get_encoding("cl100k_base")
+    num_tokens = len(encoding.encode(string))
+    return num_tokens
 
 
-@observe(as_type="generation")
-def call_llm(
-    model: str,
-    temperature: float,
-    messages: List[Dict],
-    json_response: bool = False,
-    stream: bool = False,
-) -> ChatCompletion:
-    """
-    Get an answer from the OpenAI chat model.
-
-    Args:
-        model (str): The model name to use.
-        temperature (float): The temperature setting for the model.
-        messages (List[Dict]): The list of messages to send to the model.
-        stream (bool, optional): Whether to stream the response. Defaults to False.
-
-    Returns:
-        ChatCompletion: The chat completion response from OpenAI.
-    """
-    return openai.chat.completions.create(
-        model=model,
-        response_format={"type": "json_object"} if json_response else None,
-        temperature=temperature,
-        messages=messages,
-        stream=stream,
+def search(
+    client: QdrantClient,
+    collection: str,
+    query_vector: Union[list, tuple, np.ndarray],
+    limit: int = 10,
+    query_filter: Filter = None,
+    with_vectors: bool = False,
+) -> List:
+    return client.search(
+        collection_name=collection,
+        query_vector=query_vector,
+        limit=limit,
+        with_vectors=with_vectors,
+        query_filter=query_filter,
     )
 
 
 @observe()
-def generate_response(
-    query: str, qdrant_client: QdrantClient, config: Config
-) -> Generator[str, None, None]:
+def embed_text(text: Union[str, list], model: str) -> CreateEmbeddingResponse:
     """
-    Generates a response for a given user query using a combination of semantic search and a chat model.
+    Create embeddings using OpenAI API.
+    """
+    response = openai.embeddings.create(input=text, model=model)
+    return response
+
+
+def format_context(payload: dict) -> str:
+    text = f"Naslov: {payload['title']}\n"
+    text += f"Link do člana: {payload['link']}\n"
+    text += f"{payload['text']}\n\n"
+    return text
+
+
+def get_context(search_results: List[ScoredPoint], top_k: int = None) -> str:
+    if top_k is not None:
+        search_results = sorted(search_results, key=lambda x: x.score, reverse=True)[
+            :top_k
+        ]
+    return "\n".join([format_context(point.payload) for point in search_results])
+
+
+def load_json(path: Path) -> List[Dict]:
+    """
+    Load JSON data from a file.
 
     Args:
-    - query (str): The user's query string.
-    - qdrant_client (QdrantClient): Client to interact with Qdrant's API.
-    - config (Config): Configuration settings for API interaction and response handling.
+        path (Path): The path to the JSON file.
 
-    Yields:
-    - str: Parts of the generated response from the chat model.
+    Returns:
+        List[Dict]: The JSON data loaded from the file.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
     """
+    if not path.exists():
+        logger.error(f"File: {path} does not exist.")
+        raise FileNotFoundError(f"File: {path} does not exist.")
+
+    with open(path, "r", encoding="utf-8") as file:
+        data = json.load(file)
+
+    return data
+
+
+def prepare_for_embedding(
+    output_path: Path, scraped_data: List[Dict], model: str
+) -> None:
+    """
+    Prepare data for embedding and save to a file.
+
+    Args:
+        output_path (Path): The path to save the prepared data.
+        scraped_data (List[Dict]): The scraped data to be prepared.
+        model (str): The embedding model to be used.
+
+    Returns:
+        None
+    """
+    jobs = [
+        {
+            "model": model,
+            "id": id,
+            "title": sample["title"],
+            "link": sample["link"],
+            "input": f"{sample['title']}: {' '.join(sample['texts'])}",
+        }
+        for id, sample in enumerate(scraped_data)
+    ]
+    with open(output_path, "w", encoding="utf-8") as file:
+        for job in jobs:
+            json_string = json.dumps(job)
+            file.write(json_string + "\n")
+
+
+def get_token_num(text: str, model_name: str) -> int:
+    """
+    Get the number of tokens in a text for a given model.
+
+    Args:
+        text (str): The input text.
+        model_name (str): The name of the model.
+
+    Returns:
+        int: The number of tokens in the text.
+    """
+    enc = tiktoken.encoding_for_model(model_name)
+    return len(enc.encode(text))
+
+
+def run_api_request_processor(
+    requests_filepath: Path,
+    save_path: Path,
+    max_requests_per_minute: int = 2500,
+    max_tokens_per_minute: int = 900000,
+    token_encoding_name: str = "cl100k_base",
+    max_attempts: int = 5,
+    logging_level: int = 20,
+) -> None:
+    """
+    Run the API request processor to call the OpenAI API in parallel, creating embeddings with the specified model.
+
+    Args:
+        requests_filepath (Path): The path to the requests file.
+        save_path (Path): The path to save the results.
+        max_requests_per_minute (int): Maximum number of requests per minute.
+        max_tokens_per_minute (int): Maximum number of tokens per minute.
+        token_encoding_name (str): The name of the token encoding.
+        max_attempts (int): Maximum number of attempts for each request.
+        logging_level (int): Logging level.
+
+    Returns:
+        None
+    """
+    if not requests_filepath.exists():
+        logger.error(f"File {requests_filepath} does not exist.")
+        raise FileNotFoundError(f"File {requests_filepath} does not exist.")
+    if save_path.suffix != ".jsonl":
+        logger.error(f"Save path {save_path} must be JSONL.")
+        raise ValueError(f"Save path {save_path} must be JSONL.")
+
+    command = [
+        "python",
+        "database/api_request_parallel_processor.py",
+        "--requests_filepath",
+        requests_filepath,
+        "--save_filepath",
+        save_path,
+        "--request_url",
+        "https://api.openai.com/v1/embeddings",
+        "--max_requests_per_minute",
+        str(max_requests_per_minute),
+        "--max_tokens_per_minute",
+        str(max_tokens_per_minute),
+        "--token_encoding_name",
+        token_encoding_name,
+        "--max_attempts",
+        str(max_attempts),
+        "--logging_level",
+        str(logging_level),
+    ]
+    result = subprocess.run(command, text=True, capture_output=True)
+
+    if result.returncode == 0:
+        logger.info(f"Embeddings saved to: {save_path}")
+    else:
+        logger.error("Error in Embedding execution!")
+        logger.error("Error:", result.stderr)
+
+
+# Eliminate this or make it more general
+def validate_path(path: Path) -> None:
+    if not isinstance(path, Path):
+        logger.error(f'"{path}" must be a valid Path object')
+        raise ValueError(f'"{path}" must be a valid Path object')
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def create_embeddings(
+    scraped_dir: Path, to_process_dir: Path, embeddings_dir: Path, model: str
+) -> None:
+    """
+    Embed scraped law files by preparing the data and running the request processor
+    to call the OpenAI API in parallel, creating embeddings with the specified model.
+
+    Args:
+        scraped_dir (Path): Directory to the law files.
+        to_process_dir (Path): Directory to process files.
+        embeddings_dir (Path): Directory for storing embeddings.
+        model (str): The embedding model to be used.
+
+     Raises:
+        ValueError: If any of the provided paths are invalid.
+    """
+    # Validate input paths
+    validate_path(scraped_dir)
+    validate_path(to_process_dir)
+    validate_path(embeddings_dir)
+
+    scraped_paths = list(scraped_dir.iterdir())
+
+    for file_path in tqdm(
+        scraped_paths, desc="Embedding scraped files", total=len(scraped_paths)
+    ):
+        scraped_data = load_json(path=file_path)
+
+        requests_filepath = to_process_dir / (file_path.stem + ".jsonl")
+        prepare_for_embedding(
+            output_path=requests_filepath,
+            scraped_data=scraped_data,
+            model=model,
+        )
+
+        processed_filepath = embeddings_dir / requests_filepath.name
+        run_api_request_processor(
+            requests_filepath=requests_filepath, save_path=processed_filepath
+        )
+
+
+def load_and_process_embeddings(path: Path) -> List[PointStruct]:
+    """
+    Load embeddings from a JSON lines file and process them into data points.
+
+    Args:
+        path (Path): The path to the JSON lines file containing embeddings.
+
+    Returns:
+        List[PointStruct]: A list of PointStruct objects containing the processed data.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+        IOError: If there is an error reading the file.
+        json.JSONDecodeError: If there is an error parsing the JSON.
+    """
+    if not path.exists():
+        logger.error(f"File: {path} does not exist.")
+        raise FileNotFoundError(f"File: {path} does not exist.")
+
     try:
-        # Limit the stored messages to the maximum conversation length defined in the configuration
-        st.session_state.messages = st.session_state.messages[
-            -config.openai.chat.max_conversation :
-        ]
+        with open(path, "r", encoding="utf-8") as file:
+            embedding_data = [json.loads(line) for line in file]
+    except (IOError, json.JSONDecodeError) as e:
+        logger.error(f"Error reading or parsing file: {e}")
+        raise
 
-        # Determine the relevant collections to route the query to
-        messages = formate_messages_router(query)
-        response = call_llm(
-            model=config.openai.router.model,
-            temperature=config.openai.router.temperature,
-            messages=messages,
-            json_response=True,
-        )
-        collections = json.loads(response.choices[0].message.content)["response"]
-        logger.info(f"Query routed to collections: {collections}")
-        langfuse_context.update_current_trace(tags=collections)
-
-        # Embed the user query using the specified model in the configuration
-        embedding_response = embed_text(
-            text=query,
-            model=config.openai.embeddings.model,
-        )
-        embedding = embedding_response.data[0].embedding
-
-        # Determine the context for the chat model based on the routed collections
-        context = determine_context(collections, embedding, qdrant_client)
-
-        # Generate the response stream from the chat model
-        messages = formate_messages_chat(
-            context=context, query=query, conversation=st.session_state.messages
-        )
-        stream = call_llm(
-            model=config.openai.chat.model,
-            temperature=config.openai.chat.temperature,
-            messages=messages,
-            stream=True,
-        )
-
-        # Yield each part of the response as it becomes available
-        for chunk in stream:
-            part = chunk.choices[0].delta.content
-            if part is not None:
-                yield part
-
-        langfuse_context.flush()
-
-    except Exception as e:
-        logger.error(f"An error occurred while generating the response: {str(e)}")
-        yield "Sorry, an error occurred while processing your request."
-
-
-def determine_context(
-    collections: List[str], embedding: List[float], qdrant_client: QdrantClient
-) -> str:
-    """Determines the context for generating responses based on search results from collections."""
-    try:
-        if collections[0] == DEFAULT_ROUTER_RESPONSE:
-            return DEFAULT_CONTEXT
-        else:
-            search_results = []
-            for collection_name in collections:
-                search_results.extend(
-                    search(
-                        client=qdrant_client,
-                        collection=collection_name,
-                        query_vector=embedding,
-                        limit=10,
-                        with_vectors=True,
-                    )
+    points = []
+    for item in embedding_data:
+        try:
+            points.append(
+                PointStruct(
+                    id=item[0]["id"],
+                    vector=item[1]["data"][0]["embedding"],
+                    payload={
+                        "title": item[0]["title"],
+                        "text": item[0]["input"],
+                        "link": item[0]["link"],
+                    },
                 )
-            # Upgrade this with tokes length checking
-            top_k = 15 if len(collections) > 1 else 10
-            return get_context(search_results=search_results, top_k=top_k)
-    except Exception as e:
-        logger.error(f"Error determining context: {str(e)}")
-        return DEFAULT_CONTEXT  # Fallback to default context
+            )
+        except KeyError as e:
+            logger.error(f"Missing key in embedded data: {e}")
+            continue
+    return points
